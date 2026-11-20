@@ -6,11 +6,13 @@ import sqlite3
 from tempfile import TemporaryDirectory
 from typing import Callable
 
-from admission import AdmissionArchive, accept_v1
+from admission import AdmissionArchive, CapabilityArchive, accept_capability, accept_v1
 from observations import ObservationJournal, freeze_station, record_readings
 from observations.measure import encode_measurement
-from review import ReportRegister, publish_v1, read_v1
-from station import Outbox, issue_v1
+from review import (
+    ReportRegister, ResampleRegister, publish_resample, publish_v1, read_resample, read_v1,
+)
+from station import Outbox, issue_capability, issue_v1
 from tray import PhysicalSlot, RosterCatalog, freeze_tray
 
 
@@ -51,6 +53,8 @@ class ShiftStores:
     catalog: RosterCatalog
     archive: AdmissionArchive
     reports: ReportRegister
+    capabilities: CapabilityArchive
+    resamples: ResampleRegister
     stations: dict[str, StationStore]
     station_connections: ExitStack
     center_connections: ExitStack
@@ -69,7 +73,8 @@ def connect(path: Path) -> sqlite3.Connection:
 
 
 @contextmanager
-def open_shift(root: Path, *, report_before_commit=None, outbox_before_commit=None):
+def open_shift(root: Path, *, report_before_commit=None, outbox_before_commit=None,
+               resample_before_commit=None):
     root.mkdir(parents=True, exist_ok=True)
     with ExitStack() as connections:
         catalog_db = connections.enter_context(closing(connect(root / CATALOG_FILENAME)))
@@ -82,9 +87,11 @@ def open_shift(root: Path, *, report_before_commit=None, outbox_before_commit=No
             stations[station] = StationStore(
                 ObservationJournal(db), Outbox(db, before_commit=outbox_before_commit)
             )
+        reports = ReportRegister(center_db, before_commit=report_before_commit)
         yield ShiftStores(
-            RosterCatalog(catalog_db), AdmissionArchive(center_db),
-            ReportRegister(center_db, before_commit=report_before_commit), stations,
+            RosterCatalog(catalog_db), AdmissionArchive(center_db), reports,
+            CapabilityArchive(center_db),
+            ResampleRegister(center_db, before_commit=resample_before_commit), stations,
             station_stack, center_stack,
         )
 
@@ -135,16 +142,24 @@ def initialize(root: Path) -> str:
 def demo() -> None:
     sample = load_example()
     failure = FailOnce()
+    plan_failure = FailOnce()
+    capabilities = DEMO_CAPABILITIES
     with TemporaryDirectory(prefix='ceramic-shift-') as directory:
         root = Path(directory)
         roster_id = initialize(root)
-        with open_shift(root, report_before_commit=failure) as stores:
+        with open_shift(root, report_before_commit=failure,
+                        resample_before_commit=plan_failure) as stores:
             selected_ids = []
+            companion_raw = []
             for station in STATIONS:
                 current = stores.stations[station].journal.current_revision(station, roster_id)
                 raw = seal_and_issue(stores, station, current.revision_id)
                 accepted = accept_v1(stores.archive, stores.catalog, roster_id, raw)
                 selected_ids.append(accepted.admission_id)
+                companion_raw.append(issue_capability(
+                    stores.catalog, stores.stations[station].outbox,
+                    accepted.envelope.frozen_id, capabilities[station],
+                ))
             stores.close_stations()
             failure.arm()
             try:
@@ -157,12 +172,38 @@ def demo() -> None:
             published = publish_v1(stores.archive, stores.catalog, stores.reports, *selected_ids)
             if stores.reports.counts() != (1, 1):
                 raise AssertionError('retry must commit one report and one receipt')
+
+            capability_ids = []
+            for station, raw in zip(STATIONS, companion_raw):
+                admitted = accept_capability(
+                    stores.capabilities, stores.catalog,
+                    published[0].body.sources[STATIONS.index(station)].admission_id, raw,
+                )
+                capability_ids.append(admitted['capability_id'])
+            plan_failure.arm()
+            try:
+                publish_resample(stores.capabilities, stores.catalog, stores.resamples,
+                                 published[0].report_id, *capability_ids)
+            except InjectedCommitError:
+                if stores.resamples.counts() != (0, 0):
+                    raise AssertionError('failed resample publication left a plan or receipt')
+            else:
+                raise AssertionError('expected an injected resample commit failure')
+            resample = publish_resample(
+                stores.capabilities, stores.catalog, stores.resamples,
+                published[0].report_id, *capability_ids,
+            )
+            if stores.resamples.counts() != (1, 1):
+                raise AssertionError('retry must commit one plan and one receipt')
             stores.close_center()
 
         with closing(connect(root / CENTER_FILENAME)) as reopened:
             loaded = read_v1(ReportRegister(reopened), published[0].report_id)
+            reloaded = read_resample(ResampleRegister(reopened), resample[0]['plan_id'])
         if loaded != published:
             raise AssertionError('reopened center returned different stored results')
+        if reloaded != resample:
+            raise AssertionError('reopened center returned different resample results')
 
         report, receipt = loaded
         coverage = report.body.coverage
@@ -193,6 +234,47 @@ def demo() -> None:
             'oracle': '甲检 a、b，乙仅检 b；逐槽核对得补测 c，均值手算为 (0+3)/2 和 1/1。',
         }
         print('POINTWISE_SCENARIO ' + json.dumps(scenario, ensure_ascii=False))
+
+        plan, plan_receipt = reloaded
+        print('Resample plan {} receipt {} status {} finish {}'.format(
+            plan['plan_id'], plan_receipt['receipt_id'], plan['status'], plan['finish']))
+        for source, rows in zip(plan['sources'], plan['schedules']):
+            if not rows:
+                print(f"  station {source['station']}  (no work)")
+            for row in rows:
+                if row['kind'] == 'inspect':
+                    print(f"  station {source['station']}  {row['start']:>3}-{row['end']:<3} inspect "
+                          f"{row['slot']} with {row['fixture']}")
+                else:
+                    print(f"  station {source['station']}  {row['start']:>3}-{row['end']:<3} change "
+                          f"{row['from']} -> {row['to']}")
+        resample_scenario = {
+            'case_id': 'N7',
+            'input': {
+                'report_id': plan['report_id'],
+                'sources': plan['sources'],
+                'capabilities': {station: capabilities[station] for station in STATIONS},
+                'uninspected': list(coverage.uninspected),
+            },
+            'expected': {'status': 'scheduled', 'finish': 5},
+            'actual': {'status': plan['status'], 'finish': plan['finish'],
+                       'schedules': plan['schedules']},
+            'readback': {'plan': plan, 'receipt': plan_receipt},
+            'code_paths': [
+                'station/capability.py', 'station/issue.py', 'admission/capability_archive.py',
+                'admission/accept.py', 'review/resample_schedule.py', 'review/resample.py',
+                'review/resample_register.py', 'review/resample_readback.py',
+            ],
+            'oracle': '仅 c 未检；乙无可用夹具，甲 0-2 由 X 换 Y、2-5 用 Y 检 c，甲独力完工 5 分钟。',
+        }
+        print('POINTWISE_SCENARIO ' + json.dumps(resample_scenario, ensure_ascii=False))
+
+
+DEMO_CAPABILITIES = {
+    'A': {'fixtures': ['X', 'Y'], 'initial_fixture': 'X',
+          'changes': [['X', 'Y', 2]], 'checks': [['c', 'Y', 3]]},
+    'B': {'fixtures': ['X'], 'initial_fixture': 'X', 'changes': [], 'checks': []},
+}
 
 
 if __name__ == '__main__':

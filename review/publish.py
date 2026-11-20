@@ -4,6 +4,7 @@ from tray.catalog import RosterCatalog
 
 from .coverage import calculate_coverage
 from .register import ReportRegister, ReportSource, ReviewBody, ReviewReceipt, ReviewReport
+from .resample import publish_resample as publish_resample
 from .totals import calculate_station_totals
 
 

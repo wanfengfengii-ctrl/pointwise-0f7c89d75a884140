@@ -4,8 +4,12 @@ from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from review import ReportRegister, publish_v1, read_v1
+from admission import accept_capability
+from review import (
+    ReportRegister, ResampleRegister, publish_resample, publish_v1, read_resample, read_v1,
+)
 from shift_example import CENTER_FILENAME, connect, handoff, open_shift, register_tray
+from station import issue_capability
 
 
 def capability(changes, checks):
@@ -47,23 +51,48 @@ def prepare(stores, case):
     return (report, receipt), parents, spec
 
 
+def build_plan(stores, case, publication=None, parents=None, spec=None):
+    """End to end: prepare a V1 report, issue/accept companions, sign a plan."""
+    if publication is None or parents is None or spec is None:
+        publication, parents, spec = prepare(stores, case)
+    report, _ = publication
+    capability_ids = []
+    for parent, capability_input in zip(parents, spec["capabilities"]):
+        raw = issue_capability(
+            stores.catalog, stores.stations[parent.envelope.station].outbox,
+            parent.envelope.frozen_id, capability_input,
+        )
+        accepted = accept_capability(
+            stores.capabilities, stores.catalog, parent.admission_id, raw
+        )
+        capability_ids.append(accepted["capability_id"])
+    stores.close_stations()
+    return publish_resample(
+        stores.capabilities, stores.catalog, stores.resamples, report.report_id, *capability_ids
+    )
+
+
 def main():
     for case in CASES:
         with TemporaryDirectory(prefix="resample-fixture-") as directory:
             root = Path(directory)
             with open_shift(root) as stores:
                 publication, parents, spec = prepare(stores, case)
-                stores.close_stations()
+                plan, receipt = build_plan(stores, case, publication, parents, spec)
             report, _ = publication
+            if plan["status"] != spec["status"] or plan["finish"] != spec["finish"]:
+                raise AssertionError(f"{case}: plan disagrees with the hand calculation")
             with closing(connect(root / CENTER_FILENAME)) as reopened:
-                restored = read_v1(ReportRegister(reopened), report.report_id)
-            if restored != publication:
-                raise AssertionError(f"{case}: V1 publication changed on reopen")
+                if read_v1(ReportRegister(reopened), report.report_id) != publication:
+                    raise AssertionError(f"{case}: V1 publication changed on reopen")
+                if read_resample(ResampleRegister(reopened), plan["plan_id"]) != (plan, receipt):
+                    raise AssertionError(f"{case}: resample plan changed on reopen")
             if [p.admission_id for p in parents] != [s.admission_id for s in report.body.sources]:
                 raise AssertionError(f"{case}: wrong V1 parents")
             if list(report.body.coverage.uninspected) != spec["uninspected"]:
                 raise AssertionError(f"{case}: wrong V1 uninspected slots")
-            print(json.dumps({"case": case, "v1_report_id": report.report_id, "sample": spec}))
+            print(json.dumps({"case": case, "v1_report_id": report.report_id,
+                              "plan": plan, "sample": spec}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -19,6 +19,12 @@
 | `admission.accept_v1(archive, catalog, roster_id, raw)` | 验收原始字节，返回含 `admission_id`、`raw` 和解码正文的接纳记录。`AdmissionArchive.find` 按号领取首存原件。 |
 | `review.publish_v1(archive, catalog, register, first_id, second_id)` | 按给定次序选择同盘同轮同清册的异站件，原子签出 `(ReviewReport, ReviewReceipt)`。报告正文中的来源与分站计量按选件次序对应。 |
 | `review.read_v1(register, report_id)` | 返回已保存的 `(ReviewReport, ReviewReceipt)`，报告的 `body` 含 `coverage`、`stations`、`sources` 和清册身份。 |
+| `station.issue_capability(catalog, outbox, frozen_id, capability)` | 为已发行的 V1 原站件固定补测能力伴随件，返回 UTF-8 JSON 字节。等价重发返回首存字节。 |
+| `admission.accept_capability(archive, catalog, parent_admission_id, raw)` | 核对父件语义摘要、清册与能力，返回 `{'capability_id': 整数, 'raw': 首存字节}`。 |
+| `review.publish_resample(archive, catalog, register, report_id, first_capability_id, second_capability_id)` | 按报告父件次序取两份已接纳能力件，原子签出 `(plan, receipt)`；plan 为可 JSON 序列化字典。 |
+| `review.read_resample(register, plan_id)` | 按补测计划号读回固定的 `(plan, receipt)`。 |
+
+补测能力的字段、错误分类、作业表格式与签出规则见 `RESAMPLE.md`。
 
 输入读值为 `int`、`Fraction` 或整数对 `[分子, 正分母]`。`None` 表示明确缺测，零值计入有效测次。读值单位为微米，读值和及均值按有理数保存。空站的受检槽为空、有效数和读值和为零，均值为空。来件槽表必须按冻结清册序，内部计数必须等于受检槽数。中心核验件内可以对账的字段，使用站端交付的精确读值和。等值分数和 JSON 编码空白不影响等价重投，首存字节保持原样。
 

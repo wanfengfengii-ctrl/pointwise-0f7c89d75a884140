@@ -12,6 +12,13 @@ class Outbox:
                 raw BLOB NOT NULL
             )
         ''')
+        connection.execute('''
+            CREATE TABLE IF NOT EXISTS issued_capabilities (
+                frozen_id INTEGER PRIMARY KEY,
+                content BLOB NOT NULL,
+                raw BLOB NOT NULL
+            )
+        ''')
 
     def save(self, frozen_id: int, raw: bytes) -> bytes:
         db = self.connection
@@ -34,6 +41,38 @@ class Outbox:
             raise KeyError(frozen_id)
         row = self.connection.execute(
             'SELECT raw FROM issued_envelopes WHERE frozen_id = ?', (frozen_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(frozen_id)
+        return row[0]
+
+    def save_capability(self, frozen_id: int, content: bytes, raw: bytes) -> bytes:
+        db = self.connection
+        db.execute('BEGIN IMMEDIATE')
+        with db:
+            row = db.execute(
+                'SELECT content, raw FROM issued_capabilities WHERE frozen_id = ?', (frozen_id,)
+            ).fetchone()
+            if row is not None:
+                first_content, first_raw = row
+                if first_content != content:
+                    raise ValueError(
+                        'frozen revision already has a different issued capability companion'
+                    )
+                return first_raw
+            db.execute(
+                'INSERT INTO issued_capabilities (frozen_id, content, raw) VALUES (?, ?, ?)',
+                (frozen_id, content, raw),
+            )
+            if self.before_commit is not None:
+                self.before_commit()
+        return raw
+
+    def get_capability(self, frozen_id: int) -> bytes:
+        if type(frozen_id) is not int or not 0 < frozen_id <= 2**63 - 1:
+            raise KeyError(frozen_id)
+        row = self.connection.execute(
+            'SELECT raw FROM issued_capabilities WHERE frozen_id = ?', (frozen_id,)
         ).fetchone()
         if row is None:
             raise KeyError(frozen_id)
